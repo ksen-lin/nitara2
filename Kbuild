@@ -2,7 +2,6 @@ MODNAME		?= nitara2
 
 
 obj-m		+= $(MODNAME).o
-$(MODNAME)-y	+= main.o
 
 ccflags-y	+= -Werror -fomit-frame-pointer 
 # -D DEBUG

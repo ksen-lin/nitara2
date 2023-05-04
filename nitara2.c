@@ -1,13 +1,10 @@
 /* 
- * original idea: madsys<at>ercist.iscas.ac.cn
+ * original idea: madsys, "Finding hidden kernel modules (the extrem way)"
+ *                http://phrack.org/issues/61/3.html
  *
  * usage: cat /proc/nitara2 && dmesg
  */
 
-
-#ifdef CONFIG_SMP
-#define __SMP__ 
-#endif
 
 #include <asm/uaccess.h>
 #include <asm/page.h>
@@ -28,6 +25,20 @@
 
 // TODO: add ifdef DEBUG
 #define NITARA_PRINTK(fmt, args...) printk("%s: %s():\t" fmt, module_name(THIS_MODULE), __func__, ##args)
+
+#ifndef __canonical_address
+static __always_inline u64 __canonical_address(u64 vaddr, u8 vaddr_bits)
+{
+	return ((s64)vaddr << (64 - vaddr_bits)) >> (64 - vaddr_bits);
+}
+#endif /* __canonical_address */
+
+#ifndef __is_canonical_address
+static __always_inline u64 __is_canonical_address(u64 vaddr, u8 vaddr_bits)
+{
+	return __canonical_address(vaddr, vaddr_bits) == vaddr;
+}
+#endif /* __is_canonical_address */
 
 #define is_canonical_48(p) __is_canonical_address((unsigned long)p, 48)
 #define is_canonical_or_zero(p) (p == NULL || is_canonical_48(p))
@@ -99,15 +110,15 @@ static bool addr_valid_x64(unsigned long addr, size_t size)
 }
 
 
-static bool check_addr_within_modules(void *p)
+static bool is_within_modules(void *p)
 {
     return (unsigned long)p >= MODULES_VADDR && (unsigned long)p < MODULES_END;
 }
 
 
-__maybe_unused static bool check_addr_within_modules_or_zero(void *p)
+__maybe_unused static bool is_within_modules_or_zero(void *p)
 {
-    return p == NULL || check_addr_within_modules(p);
+    return p == NULL || is_within_modules(p);
 }
 
 
@@ -150,26 +161,28 @@ ssize_t showmodule_read(struct file *unused_file, char *buffer, size_t len, loff
             addr_valid_x64((unsigned long)p, sizeof(struct module))
             && p->state >= MODULE_STATE_LIVE && p->state <= MODULE_STATE_UNFORMED
             && check_name_valid(p->name)
-            && check_addr_within_modules_or_zero(p->init) // may be unset for modules that can also be compiled as part of kernel
+            && is_within_modules_or_zero(p->init) // may be unset for modules that can also be compiled as part of kernel
             && (p->exit || p->list.next || p->list.prev)
             && is_canonical_high_or_zero(p->list.next) 
             && is_canonical_high_or_zero(p->list.prev) 
             && is_canonical_high_or_zero(p->exit)
-            // && is_canonical_high_or_zero(p->modinfo_attrs) // should not be messed with
             && is_canonical_or_zero(p->args)
-            && is_canonical_high_or_zero(p->version)
-            && is_canonical_high_or_zero(p->syms)
-            && is_canonical_high_or_zero(p->kp)
+            // && is_canonical_high_or_zero(p->version)
+            && is_canonical_high_or_zero(p->syms) // at least init() must be...
+            // && is_canonical_high_or_zero(p->kp)
             // || is_canonical_high_or_zero(p->crcs))
+            // && is_canonical_high_or_zero(p->modinfo_attrs) // should not be messed with
             // && is_canonical_high_or_zero(p->srcversion) // should not be messed with
             // && is_canonical_high_or_zero(p->holders_dir)// should not be messed with
-            && check_addr_within_modules_or_zero(p->exit)
-            && (check_addr_within_modules_or_zero(p->list.next) || check_addr_within_modules_or_zero(p->list.prev))
-            && p->noinstr_text_size < 0x100 * PAGE_SIZE  /* a simple sanity check for about 1MB */
+            && is_within_modules_or_zero(p->exit)
+            && (is_within_modules_or_zero(p->list.next) || is_within_modules_or_zero(p->list.prev))
+            && (p->init_layout.size + p->core_layout.size  < 0x200 * PAGE_SIZE) // 2 MiB
+            && (p->init_layout.size + p->core_layout.size  >= 2 * PAGE_SIZE)
+            // && p->taints // NOTE: https://elixir.bootlin.com/linux/v5.15/source/kernel/module.c#L1130
+            && module_refcount(p) < 32
         ) {
-            NITARA_PRINTK("0x%lx[%u]: \"%s\",\tnext %#lx, prev %#lx exit %#lx\n", 
+            NITARA_PRINTK("0x%lx: \"%s\",\tnext %#lx, prev %#lx exit %#lx\n", 
                             (unsigned long)p,
-                            p->noinstr_text_size,
                             p->name,
                             (unsigned long)p->list.next,
                             (unsigned long)p->list.prev,
