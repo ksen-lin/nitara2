@@ -5,27 +5,40 @@
  * usage: cat /proc/nitara2 && dmesg
  */
 
-
-#include <asm/uaccess.h>
 #include <asm/page.h>
-#include <asm/pgtable.h>
 #include <asm/fixmap.h>
-
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/proc_fs.h>
-#include <linux/pgtable.h>
-#include <linux/string.h>
-#include <linux/types.h>
-#include <linux/unistd.h>
 #include <linux/version.h>
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+#  include <linux/pgtable.h>
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+// #  include <asm-generic/5level-fixup.h>
+#  include <asm-generic/pgtable-nop4d.h>
+#  include <asm/pgtable.h>
+#else /* < 4.11 */
+#  include <asm/pgtable.h>
+#endif
+
+#include <linux/string.h>
+#include <linux/sched.h>
+#include <linux/types.h>
+#include <linux/unistd.h>
 #include <uapi/linux/stat.h>
 
-// TODO: add ifdef DEBUG
-#define NITARA_PRINTK(fmt, args...) printk("%s: %s():\t" fmt, module_name(THIS_MODULE), __func__, ##args)
 
+#define NITARA_PRINTK(fmt, args...) printk("%s: " fmt, module_name(THIS_MODULE), ##args)
+#define NITARA_MODSIZE (0x1000 * PAGE_SIZE)
+
+/* https://patchwork.kernel.org/project/linux-fsdevel/patch/1515636190-24061-6-git-send-email-keescook@chromium.org/ */
+#ifndef sizeof_field
+#define sizeof_field(TYPE, MEMBER) sizeof((((TYPE *)0)->MEMBER))
+#endif
+
+/* NOTE: arch-specific, we don't handle it yet */
 #ifndef __canonical_address
 static __always_inline u64 __canonical_address(u64 vaddr, u8 vaddr_bits)
 {
@@ -48,11 +61,16 @@ static __always_inline u64 __is_canonical_address(u64 vaddr, u8 vaddr_bits)
 /*
  * https://stackoverflow.com/questions/11134813/check-validity-of-virtual-memory-address
  * https://stackoverflow.com/questions/66593710/how-to-check-an-address-is-accessible-in-the-kernel-space
+ * 
+ * on 5-level paging introduction (6 Mar 2017, "patchset is build on top of v4.11-rc1"):
+ * https://lwn.net/Articles/716324/
  */
-static bool page_mapping_exist(unsigned long addr, size_t size)
+static bool valid_addr(unsigned long addr, size_t size)
 {
     pgd_t *pgd;
-	p4d_t *p4d;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+    p4d_t *p4d;
+#endif
     pmd_t *pmd;
     pud_t *pud;
     pte_t *pte;
@@ -62,12 +80,15 @@ static bool page_mapping_exist(unsigned long addr, size_t size)
     pgd = pgd_offset(mm, addr);
     if (unlikely(!pgd) || unlikely(pgd_none(*pgd)) || unlikely(!pgd_present(*pgd)) )
         return false;
-
-    p4d = p4d_offset(pgd, addr); // TODO: add check for CONFIG_PGTABLE_LEVELS ?
+        
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+    p4d = p4d_offset(pgd, addr);
     if (unlikely(!p4d) || unlikely(p4d_none(*p4d)) || unlikely(!p4d_present(*p4d)) )
         return false;
-    
     pud = pud_offset(p4d, addr);
+#else
+    pud = pud_offset(pgd, addr);
+#endif
     if (unlikely(!pud) || unlikely(pud_none(*pud)) || unlikely(!pud_present(*pud)))
         return false;
 
@@ -90,23 +111,7 @@ end:
     if (end_addr >= addr + size - 1)
         return true;
 
-    return page_mapping_exist(end_addr + 1, size - (end_addr - addr + 1));
-}
-
-
-static bool addr_valid_x64(unsigned long addr, size_t size)
-{
-    // int i;
-    // for (i = 0; i < size; i++)
-    //     if (!virt_addr_valid(addr + i)) {            // <------ returns true only for addresses within kernel
-    //         NITARA_PRINTK("[-] %#lx[%i]: virt_addr_valid() false\n", addr, i);
-    //         return false;
-    //     }
-
-    if (!page_mapping_exist(addr, size))
-        return false;
-
-    return true;
+    return valid_addr(end_addr + 1, size - (end_addr - addr + 1));
 }
 
 
@@ -129,13 +134,13 @@ static bool check_name_valid(char *s)
         return false;
     
     for (i = 0; i < sizeof_field(struct module, name); i += 1) {
+        /* we might fail here if the name is "" */
         if (s[i] == '\0' && i != 0)
             break;
-
         if (s[i] < 0x20 || s[i] > 0x7e)
             return false;
     }
-            
+           
     return true;
 }
 
@@ -145,62 +150,48 @@ ssize_t showmodule_read(struct file *unused_file, char *buffer, size_t len, loff
     struct module *p;
     unsigned long i;
 
-    NITARA_PRINTK("address                         module\n");
-
+    NITARA_PRINTK("address                           module size\n");
     for (
         i = 0, p = (struct module *)MODULES_VADDR;
         p <= (struct module*)(MODULES_END - 0x10);
-        p = ((struct module*)((unsigned long)p + 0x10))
+        p = ((struct module*)((unsigned long)p + 0x10)), i += 1
     ) {
-
-#ifdef NITARA_DEBUG
-        if (((unsigned long)p % (PAGE_SIZE)) == 0)
-            NITARA_PRINTK("checking 0x%llx (p->name at %#lx)\n", (unsigned long long)p, (unsigned long)&(p->name));
-#endif
         if (
-            addr_valid_x64((unsigned long)p, sizeof(struct module))
+            valid_addr((unsigned long)p, sizeof(struct module))
             && p->state >= MODULE_STATE_LIVE && p->state <= MODULE_STATE_UNFORMED
             && check_name_valid(p->name)
-            && is_within_modules_or_zero(p->init) // may be unset for modules that can also be compiled as part of kernel
-            && (p->exit || p->list.next || p->list.prev)
-            && is_canonical_high_or_zero(p->list.next) 
-            && is_canonical_high_or_zero(p->list.prev) 
-            && is_canonical_high_or_zero(p->exit)
-            && is_canonical_or_zero(p->args)
-            // && is_canonical_high_or_zero(p->version)
-            && is_canonical_high_or_zero(p->syms) // at least init() must be...
-            // && is_canonical_high_or_zero(p->kp)
-            // || is_canonical_high_or_zero(p->crcs))
-            // && is_canonical_high_or_zero(p->modinfo_attrs) // should not be messed with
-            // && is_canonical_high_or_zero(p->srcversion) // should not be messed with
-            // && is_canonical_high_or_zero(p->holders_dir)// should not be messed with
+            // may be unset for modules that can also be compiled as part of kernel (?)
+            && is_within_modules_or_zero(p->init)
             && is_within_modules_or_zero(p->exit)
-            && (is_within_modules_or_zero(p->list.next) || is_within_modules_or_zero(p->list.prev))
-            && (p->init_layout.size + p->core_layout.size  < 0x200 * PAGE_SIZE) // 2 MiB
-            && (p->init_layout.size + p->core_layout.size  >= 2 * PAGE_SIZE)
-            // && p->taints // NOTE: https://elixir.bootlin.com/linux/v5.15/source/kernel/module.c#L1130
-            && module_refcount(p) < 32
+            && (p->init || p->exit || p->list.next || p->list.prev)
+            // https://elixir.bootlin.com/linux/v5.19/source/include/linux/list.h#L146
+            && (is_canonical_high_or_zero(p->list.next) || p->list.next == LIST_POISON1)
+            && (is_canonical_high_or_zero(p->list.prev) || p->list.prev == LIST_POISON2)
+            && p->core_layout.size && (p->core_layout.size % PAGE_SIZE == 0)
+            // https://elixir.bootlin.com/linux/v5.15/source/kernel/module.c#L1130
+            // && p->taints
         ) {
-            NITARA_PRINTK("0x%lx: \"%s\",\tnext %#lx, prev %#lx exit %#lx\n", 
-                            (unsigned long)p,
-                            p->name,
-                            (unsigned long)p->list.next,
-                            (unsigned long)p->list.prev,
-                            (unsigned long)p->exit);
+            NITARA_PRINTK("0x%lx: %20s %u\n", (unsigned long)p, p->name, p->core_layout.size);
         }
-        i += 1;
     }
 
     NITARA_PRINTK("end check (total gone %lu steps)\n", i);
-
     return 0;
 }
 
 
+#if LINUX_VERSION_CODE > KERNEL_VERSION(5, 5, 19)
 static struct proc_ops nitara2_ops = {
     .proc_read = showmodule_read,
     .proc_lseek	= default_llseek, // otherwise segfaults
 };
+#else /* < 4.20 (?!?) TODO: check creating proc entry for intermediate versions */ 
+// include/linux/fs.h#L1692
+static struct file_operations nitara2_ops = {
+    .read = showmodule_read,
+    .llseek	= default_llseek,
+};
+#endif
 
 
 struct proc_dir_entry *entry;
@@ -208,7 +199,7 @@ struct proc_dir_entry *entry;
 
 int init_module()
 {
-    NITARA_PRINTK("starting\n");
+    NITARA_PRINTK("[creating proc entry]\n");
     entry = proc_create_data("nitara2", S_IRUSR, NULL, &nitara2_ops, NULL);
 
     return 0;
@@ -217,7 +208,7 @@ int init_module()
 
 void cleanup_module()
 {
-    NITARA_PRINTK("cleanup...\n");
+    NITARA_PRINTK("[cleanup proc]\n");
     proc_remove(entry);
 }
 
