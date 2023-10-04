@@ -13,4 +13,4 @@ As the original module was written at the time of 2.2—2.4 kernels and IA32 arc
 * module descriptor structs seem to get allocated within module mapping area and not vmalloc region, as was in the original work (see [Memory layout of x86-64](https://www.kernel.org/doc/Documentation/x86/x86_64/mm.txt))
 * module mapping area on x64 is about 12 times larger than vmalloc area on i386 (1520 MB vs 128M, regardless of paging levels), so more checks were added eliminate false positives that become more possible with a larger region, still without introducing false negatives.
 
-Tested on x86_64 4.4 (Ubuntu 16.04), 5.15 (Ubuntu 22.04), 5.19 kernels. Also builds on Raspberry (6.1.21) but does not (yet) find anything due to arch-specific stuff :D
+Tested on x86_64 4.4 (Ubuntu 16.04), 5.15 (Ubuntu 22.04), 5.19, 6.5 kernels

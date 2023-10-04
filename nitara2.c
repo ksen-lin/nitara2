@@ -13,13 +13,14 @@
 #include <linux/proc_fs.h>
 #include <linux/version.h>
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+#  include <linux/mm.h>
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 #  include <linux/pgtable.h>
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
-// #  include <asm-generic/5level-fixup.h>
 #  include <asm-generic/pgtable-nop4d.h>
-#  include <asm/pgtable.h>
 #else /* < 4.11 */
+// at this point Linux didn't have 5-level pgtables
 #  include <asm/pgtable.h>
 #endif
 
@@ -29,6 +30,9 @@
 #include <linux/unistd.h>
 #include <uapi/linux/stat.h>
 
+#ifndef CONFIG_X86_64
+#  error "arch not supported :("
+#endif
 
 #define NITARA_PRINTK(fmt, args...) printk("%s: " fmt, module_name(THIS_MODULE), ##args)
 #define NITARA_MODSIZE (0x1000 * PAGE_SIZE)
@@ -38,20 +42,18 @@
 #define sizeof_field(TYPE, MEMBER) sizeof((((TYPE *)0)->MEMBER))
 #endif
 
-/* NOTE: arch-specific, we don't handle it yet */
-#ifndef __canonical_address
+/* NOTE: arch-specific, we don't handle it properly yet */
+#if defined(CONFIG_X86_64) && (LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0))
 static __always_inline u64 __canonical_address(u64 vaddr, u8 vaddr_bits)
 {
 	return ((s64)vaddr << (64 - vaddr_bits)) >> (64 - vaddr_bits);
 }
-#endif /* __canonical_address */
 
-#ifndef __is_canonical_address
 static __always_inline u64 __is_canonical_address(u64 vaddr, u8 vaddr_bits)
 {
 	return __canonical_address(vaddr, vaddr_bits) == vaddr;
 }
-#endif /* __is_canonical_address */
+#endif
 
 #define is_canonical_48(p) __is_canonical_address((unsigned long)p, 48)
 #define is_canonical_or_zero(p) (p == NULL || is_canonical_48(p))
@@ -101,7 +103,9 @@ static bool valid_addr(unsigned long addr, size_t size)
         goto end;
     }
 
-    pte = pte_offset_map(pmd, addr);
+    // NOTE: pte_offset_map() is unusable out-of-tree on >=6.5.
+    //       As pte_offset_kernel() seems to work, use it instead ¯\_(ツ)_/¯
+    pte = pte_offset_kernel(pmd, addr);
     if (unlikely(!pte) || unlikely(!pte_present(*pte)))
         return false;
 
@@ -145,6 +149,20 @@ static bool check_name_valid(char *s)
 }
 
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+#define MODSIZE(p)                              \
+       (p->mem[MOD_TEXT].size                   \
+       + p->mem[MOD_INIT_TEXT].size             \
+       + p->mem[MOD_INIT_DATA].size             \
+       + p->mem[MOD_INIT_RODATA].size           \
+       + p->mem[MOD_RO_AFTER_INIT].size         \
+       + p->mem[MOD_RODATA].size                \
+       + p->mem[MOD_DATA].size)
+#else
+#  define MODSIZE(p) (p->core_layout.size)
+#endif
+
+
 ssize_t showmodule_read(struct file *unused_file, char *buffer, size_t len, loff_t *off)
 {
     struct module *p;
@@ -167,11 +185,11 @@ ssize_t showmodule_read(struct file *unused_file, char *buffer, size_t len, loff
             // https://elixir.bootlin.com/linux/v5.19/source/include/linux/list.h#L146
             && (is_canonical_high_or_zero(p->list.next) || p->list.next == LIST_POISON1)
             && (is_canonical_high_or_zero(p->list.prev) || p->list.prev == LIST_POISON2)
-            && p->core_layout.size && (p->core_layout.size % PAGE_SIZE == 0)
+            && MODSIZE(p) && (MODSIZE(p) % PAGE_SIZE == 0)
             // https://elixir.bootlin.com/linux/v5.15/source/kernel/module.c#L1130
             // && p->taints
         ) {
-            NITARA_PRINTK("0x%lx: %20s %u\n", (unsigned long)p, p->name, p->core_layout.size);
+            NITARA_PRINTK("0x%lx: %20s %u\n", (unsigned long)p, p->name, MODSIZE(p));
         }
     }
 
