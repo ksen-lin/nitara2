@@ -163,7 +163,7 @@ static bool check_name_valid(char *s)
 #endif
 
 
-ssize_t showmodule_read(struct file *unused_file, char *buffer, size_t len, loff_t *off)
+static ssize_t showmodule_read(struct file *unused_file, char *buffer, size_t len, loff_t *off)
 {
     struct module *p;
     unsigned long i;
